@@ -5,6 +5,7 @@ AutoTrading User Agent
 - 시작 시 자동으로 중앙 서버에 URL 등록
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -13,7 +14,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 import httpx
 from fastapi import FastAPI, HTTPException, Header
@@ -32,6 +33,10 @@ logger = logging.getLogger("agent")
 
 # ===== 거래소 클라이언트 싱글톤 =====
 _exchange_client: Optional[AgentExchangeClient] = None
+
+# ===== 수동 포지션 감지 상태 =====
+_known_positions: Dict[str, Optional[dict]] = {}   # symbol → position dict (None = no position)
+_bot_executed_symbols: set = set()                  # 봇이 market_entry 실행한 심볼 (수동 오감지 방지)
 
 
 def get_exchange_client() -> AgentExchangeClient:
@@ -122,6 +127,81 @@ async def register_with_central(agent_url: str):
         logger.error(f"Failed to register with central server: {e}")
 
 
+# ===== 수동 포지션 감지 =====
+
+def _normalize_symbol(raw_symbol: str) -> str:
+    """ccxt 심볼 형식 → Bybit 형식 변환 (BTC/USDT:USDT → BTCUSDT)"""
+    return raw_symbol.replace("/USDT:USDT", "USDT").replace("/", "")
+
+
+async def _notify_manual_position(symbol: str, pos: dict):
+    """메인서버 /api/agent/manual-position 콜백"""
+    if not settings.central_url:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            resp = await http.post(
+                f"{settings.central_url}/api/agent/manual-position",
+                json={
+                    "symbol": symbol,
+                    "side": pos.get("side", ""),
+                    "qty": str(pos.get("contracts", "0")),
+                    "entry_price": str(pos.get("entryPrice", "0")),
+                    "leverage": int(pos.get("leverage", 10)),
+                },
+                headers={"Authorization": f"Bearer {settings.agent_token}"},
+            )
+            if resp.status_code == 200:
+                logger.info(f"[ManualDetect] 메인서버 콜백 성공: {symbol}")
+            else:
+                logger.warning(f"[ManualDetect] 메인서버 콜백 실패: {resp.status_code} {resp.text}")
+    except Exception as e:
+        logger.error(f"[ManualDetect] 콜백 오류: {e}")
+
+
+async def detect_manual_positions():
+    """30초마다 포지션 폴링 — 수동 진입 감지 시 메인서버 콜백"""
+    global _known_positions, _bot_executed_symbols
+    await asyncio.sleep(15)  # 시작 직후 1회 초기화
+    client = get_exchange_client()
+
+    # 초기 포지션 스냅샷 (서버 시작 시 이미 있던 포지션은 수동 감지 스킵)
+    try:
+        existing = await client.get_all_positions()
+        for pos in existing:
+            raw_symbol = pos.get("symbol", "")
+            symbol = _normalize_symbol(raw_symbol)
+            _known_positions[symbol] = pos
+        logger.info(f"Initial position snapshot: {list(_known_positions.keys())}")
+    except Exception as e:
+        logger.error(f"Initial position snapshot failed: {e}")
+
+    while True:
+        await asyncio.sleep(30)
+        try:
+            current_positions = await client.get_all_positions()
+            current_map = {_normalize_symbol(p.get("symbol", "")): p for p in current_positions}
+
+            for symbol, pos in current_map.items():
+                if symbol not in _known_positions:
+                    # 새 포지션 등장
+                    if symbol in _bot_executed_symbols:
+                        _bot_executed_symbols.discard(symbol)
+                        logger.info(f"[ManualDetect] 봇 진입 감지 스킵: {symbol}")
+                    else:
+                        logger.info(f"[ManualDetect] 수동 포지션 감지: {symbol}")
+                        await _notify_manual_position(symbol, pos)
+                _known_positions[symbol] = pos
+
+            # 청산된 포지션 제거
+            for symbol in list(_known_positions.keys()):
+                if symbol not in current_map:
+                    del _known_positions[symbol]
+
+        except Exception as e:
+            logger.error(f"[ManualDetect] 폴링 오류: {e}")
+
+
 # ===== Lifespan =====
 
 @asynccontextmanager
@@ -135,6 +215,7 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("RAILWAY_PUBLIC_DOMAIN not set - skipping registration (local mode)")
 
+    asyncio.create_task(detect_manual_positions())
     logger.info(f"Agent started: exchange={settings.exchange}, user={settings.user_id[:8]}...")
     yield
     logger.info("Agent shutting down")
@@ -247,6 +328,7 @@ async def execute_order(request: ExecuteRequest):
                     if dca_id:
                         dca_order_ids.append(dca_id)
 
+            _bot_executed_symbols.add(symbol)
             logger.info(
                 f"market_entry completed: {symbol} {request.side} {request.qty} "
                 f"(market={order_id}, tp={len(tp_order_ids)}, dca={len(dca_order_ids)})"
