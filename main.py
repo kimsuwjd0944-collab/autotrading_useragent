@@ -157,7 +157,7 @@ async def _post_to_central(path: str, payload: dict):
             payload_bytes,
             hashlib.sha256,
         ).hexdigest()
-        async with httpx.AsyncClient(verify=True, timeout=10.0) as http:
+        async with httpx.AsyncClient(verify=True, timeout=30.0) as http:
             resp = await http.post(
                 f"{settings.central_url_normalized}{path}",
                 content=payload_bytes,
